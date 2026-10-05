@@ -5,10 +5,23 @@ import subprocess
 import tempfile
 import unittest
 
-from source_audit import acquire, audit, write_blob
+from source_audit import acquire, audit, write_blob, ack_version
 
 
 class SourceAuditTest(unittest.TestCase):
+    def test_real_ack_metadata_empty_extra_and_config_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "Makefile").write_text("VERSION = 6\nPATCHLEVEL = 1\nSUBLEVEL = 177\nEXTRAVERSION =\nNAME = Curry Ramen\n")
+            (root / "build.config.common").write_text("BRANCH=android14-6.1\nKMI_GENERATION=11\n")
+            fields, generation, sources = ack_version(root)
+            self.assertEqual(fields["EXTRAVERSION"], "")
+            self.assertEqual(generation, "11")
+            self.assertEqual(sources, ["build.config.common"])
+            (root / "KMI_GENERATION").write_text("12\n")
+            with self.assertRaises(ValueError):
+                ack_version(root)
+
     def test_pinned_export_and_patch_coverage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

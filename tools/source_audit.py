@@ -67,6 +67,33 @@ def patch_targets(repo, sha, paths):
     return targets
 
 
+def ack_version(dest):
+    """Read literal source metadata without sourcing shell configuration."""
+    text = (dest / "Makefile").read_text()
+    fields = {}
+    for key in ("VERSION", "PATCHLEVEL", "SUBLEVEL", "EXTRAVERSION"):
+        match = re.search(rf"^{key}[ \t]*=[ \t]*([^\r\n]*)$", text, re.M)
+        if not match:
+            raise ValueError(f"Missing {key} in {dest}/Makefile")
+        fields[key] = match.group(1).strip()
+    candidates = []
+    generation = dest / "KMI_GENERATION"
+    if generation.exists():
+        value = generation.read_text().strip()
+        if not re.fullmatch(r"[0-9]+", value):
+            raise ValueError("Nonliteral KMI_GENERATION")
+        candidates.append((value, "KMI_GENERATION"))
+    common = dest / "build.config.common"
+    if common.exists():
+        match = re.search(r"^KMI_GENERATION[ \t]*=[ \t]*([0-9]+)[ \t]*$",
+                          common.read_text(), re.M)
+        if match:
+            candidates.append((match.group(1), "build.config.common"))
+    if len({value for value, _ in candidates}) > 1:
+        raise ValueError("Conflicting KMI generation metadata")
+    return fields, (candidates[0][0] if candidates else None), [p for _, p in candidates]
+
+
 def audit(config, output):
     output.mkdir(parents=True, exist_ok=False)
     report = {"scope": "source research only; no build/device compatibility claim",
@@ -107,16 +134,10 @@ def audit(config, output):
             entry["exported_blobs"] = [write_blob(repo, spec["commit"], p, dest) for p in selected]
             makefile = dest / "Makefile"
             if makefile.exists() and spec["kind"] == "ack":
-                text = makefile.read_text()
-                fields = {}
-                for key in ("VERSION", "PATCHLEVEL", "SUBLEVEL", "EXTRAVERSION"):
-                    match = re.search(rf"^{key}\s*=\s*(.*)$", text, re.M)
-                    if not match:
-                        raise ValueError(f"Missing {key} in {name}/Makefile")
-                    fields[key] = match.group(1).strip()
+                fields, generation, generation_sources = ack_version(dest)
                 entry["makefile_version"] = fields
-                generation = dest / "KMI_GENERATION"
-                entry["kmi_generation"] = generation.read_text().strip() if generation.exists() else None
+                entry["kmi_generation"] = generation
+                entry["kmi_generation_sources"] = generation_sources
                 print(f"ACK {name}: {json.dumps(fields)} KMI={entry['kmi_generation']}", flush=True)
 
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
