@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import re
 import sys
-import uuid
 import zipfile
 
 CHUNK = 24 * 1024 * 1024
@@ -49,8 +48,10 @@ def collect(pairs, destination):
     else:
         with archive.open('rb') as source:
             while block := source.read(CHUNK):
-                part = destination / ('STOCK_BOOT_INPUTS.zip.part%03d' % (len(transport)+1))
-                part.write_bytes(block)
+                number = len(transport) + 1
+                part = destination / ('STOCK_BOOT_INPUTS.part%03d.zip' % number)
+                with zipfile.ZipFile(part, 'w', compression=zipfile.ZIP_STORED) as wrapper:
+                    wrapper.writestr('STOCK_BOOT_INPUTS.zip.part%03d' % number, block)
                 transport.append(part)
     receipt = {'archive': archive.name, 'bytes': archive.stat().st_size, 'sha256': archive_hash,
                'parts': [{'file': x.name, 'bytes': x.stat().st_size, 'sha256': digest(x)} for x in transport]}
