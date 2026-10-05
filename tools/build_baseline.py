@@ -62,10 +62,13 @@ def build(variant):
         run(prefix + ["update-ref", "refs/remotes/origin/dev", NEXT_BASE])
         run(prefix + ["update-ref", "refs/tags/v3.4.0", NEXT_TAG])
         run(prefix + ["sparse-checkout", "init", "--cone"])
-        run(prefix + ["sparse-checkout", "set", "kernel"])
+        run(prefix + ["sparse-checkout", "set", "kernel", "uapi"])
         run(prefix + ["checkout", "-b", "dev-susfs", NEXT])
         if (next_root / ".git/shallow").exists():
             raise ValueError("KernelSU version ancestry is incomplete")
+        for header in ("app_profile.h", "feature.h", "ksu.h", "selinux.h", "sulog.h", "supercall.h"):
+            if not (next_root / "kernel/include/uapi" / header).is_file():
+                raise ValueError("Incomplete KernelSU UAPI checkout: " + header)
         susfs_root = root / "susfs"
         fetch(susfs_root, "https://gitlab.com/simonpunk/susfs4ksu.git", SUSFS)
         integration = integrate(common, next_root, susfs_root, metadata)
@@ -119,6 +122,9 @@ def build(variant):
     print(variant.upper() + " COMPILATION; NOT A DEVICE COMPATIBILITY PASS", flush=True)
     started = time.monotonic()
     jobs = max(1, min(os.cpu_count() or 1, 4))
+    if variant == "evil":
+        # Fail early on integration compile errors; objects are reused by the full build.
+        run(make + [f"-j{jobs}", "drivers/kernelsu/", "fs/susfs.o"], env=env, timeout=1800)
     run(make + [f"-j{jobs}", "Image", "modules"], env=env, timeout=7200)
     image_dest = Path(variant + "-image"); image_dest.mkdir(exist_ok=False)
     names = [".config", "Module.symvers", "System.map", "include/config/kernel.release"]

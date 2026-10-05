@@ -47,6 +47,7 @@ jobs:
             ${{ matrix.variant }}-work/out/.config
           if-no-files-found: warn
           retention-days: 30
+          include-hidden-files: true
       - name: Preserve raw kernel for offline analysis
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
