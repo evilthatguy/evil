@@ -1,0 +1,34 @@
+name: Pinned source research
+
+on:
+  push:
+    branches: [engineering/np03j-bootstrap]
+    paths:
+      - .github/workflows/source-audit.yml
+      - tools/source_audit.py
+      - sources/research-inputs.json
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Fetch immutable sources and export research files
+        run: |
+          python3 -m unittest discover -s tools -p 'test_source_audit.py'
+          python3 tools/source_audit.py
+      - name: Preserve source evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: np03j-source-audit
+          path: source-audit/
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,38 @@
+{
+  "observed_at": "2026-10-05T15:26:14+03:00",
+  "status": "Research candidates, not an approved build lockfile",
+  "sources": {
+    "ack_lts": {
+      "kind": "ack",
+      "url": "https://android.googlesource.com/kernel/common",
+      "commit": "4056c236e4c84d5fdc5c80409a8fa37ef82f53b9",
+      "observed_ref": "refs/heads/android14-6.1-lts"
+    },
+    "ack_tag_177": {
+      "kind": "ack",
+      "url": "https://android.googlesource.com/kernel/common",
+      "commit": "38c2ee7f1213aaa84824aa93e0fbfb80bdb3efb6",
+      "observed_ref": "refs/tags/android14-6.1.177_r00",
+      "tag_object": "2816a96e16f5ce01231160e15490d3fe5cedb848"
+    },
+    "susfs": {
+      "kind": "susfs",
+      "url": "https://gitlab.com/simonpunk/susfs4ksu.git",
+      "commit": "24743360ea08d98f6ad72b856851abed8de5854f",
+      "observed_ref": "refs/heads/gki-android14-6.1"
+    },
+    "next_official": {
+      "kind": "next",
+      "url": "https://github.com/KernelSU-Next/KernelSU-Next.git",
+      "commit": "1a879d6a866f80b1fa1c1009a2ffa747873cbb5e",
+      "observed_ref": "refs/tags/v3.4.0"
+    },
+    "next_susfs_candidate": {
+      "kind": "next",
+      "url": "https://github.com/pershoot/KernelSU-Next.git",
+      "commit": "a358a49e697e2bab057af9145493d5a3e13f5324",
+      "observed_ref": "refs/heads/dev-susfs",
+      "status": "Unofficial compatibility fork; integration delta not yet approved"
+    }
+  }
+}
