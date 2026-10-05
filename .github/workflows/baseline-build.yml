@@ -1,0 +1,57 @@
+name: Build evil kernel and ACK control
+
+on:
+  push:
+    branches: [engineering/np03j-bootstrap]
+    paths:
+      - .github/workflows/baseline-build.yml
+      - tools/build_baseline.py
+      - tools/integrate_root.py
+      - tools/test_integrate_root.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kernel:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [evil, baseline]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install host build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential bc bison flex libssl-dev libelf-dev python3 rsync kmod dwarves lz4 zstd
+      - name: Compile pinned kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools -p 'test_source_audit.py'
+          python3 -m unittest discover -s tools -p 'test_integrate_root.py'
+          python3 tools/build_baseline.py --variant '${{ matrix.variant }}' 2>&1 | tee '${{ matrix.variant }}-build.log'
+      - name: Preserve metadata and diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.variant }}-metadata
+          path: |
+            ${{ matrix.variant }}-metadata/
+            ${{ matrix.variant }}-build.log
+            ${{ matrix.variant }}-work/out/.config
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Preserve raw kernel for offline analysis
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.variant }}-raw-image
+          path: ${{ matrix.variant }}-image/
+          if-no-files-found: error
+          retention-days: 30
