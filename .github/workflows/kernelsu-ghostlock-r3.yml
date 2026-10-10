@@ -204,6 +204,7 @@ jobs:
           curl -fL --retry 3 \
             https://github.com/topjohnwu/ondk/releases/download/r30.1/ondk-r30.1-linux.tar.xz \
             -o "$RUNNER_TEMP/ondk.tar.xz"
+          printf '%s  %s\n' 'a05e40a2b44e57c3103dd09721d3c2fccd3211e35db1ff9818e6f2a44e210289' "$RUNNER_TEMP/ondk.tar.xz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/ondk"
           tar -C "$RUNNER_TEMP/ondk" --strip-components=1 -xf "$RUNNER_TEMP/ondk.tar.xz"
           rustup toolchain link ondk "$RUNNER_TEMP/ondk/toolchains/rust"
@@ -224,12 +225,16 @@ jobs:
           make -C ghost/src ghostlock -j2 2>&1 | tee out/ghost-native-build.txt
           ! grep -E '(^| )warning:|(^| )error:' out/ghost-native-build.txt
           make -C ghost/src lint-tidy 2>&1 | tee out/ghost-clang-tidy.txt
+          cp ghost-r2-baseline/build/native/ghostlock out/ghost-r2-baseline.native
+          cp ghost/build/native/ghostlock out/ghost-reviewed.native
+          cp ghost/build/native/ghostlock out/ghost-reviewed-stripped.so
+          "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-all out/ghost-reviewed-stripped.so
+          cp "$ANDROID_HOME/build-tools/37.0.0/lib/apksigner.jar" out/apksigner.jar
           LLVM_OBJDUMP="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump" \
-            python3 ghost/tools/cmp_disasm.py ghost-r2-baseline/build/native/ghostlock ghost/build/native/ghostlock \
+            python3 r3/review_disassembly.py ghost-r2-baseline/build/native/ghostlock ghost/build/native/ghostlock out \
             | tee out/ghost-disassembly-review.txt
           sha256sum ghost-r2-baseline/build/native/ghostlock ghost/build/native/ghostlock \
             > out/ghost-native-baselines.txt
-          cp "$ANDROID_HOME/build-tools/37.0.0/lib/apksigner.jar" out/apksigner.jar
 
       - name: Build the separate GhostLock trial app
         working-directory: ghost

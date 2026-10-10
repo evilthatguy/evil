@@ -53,7 +53,9 @@ R2's signing key was ephemeral and cannot be recovered. R3 needs one initial uni
 - Build the android14-6.1 LKM with the final public certificate, check ELF and embedded metadata.
 - Android Rust check, clippy and formatting; manager release build.
 - GhostLock native host tests, NDK build, clang-tidy, Kotlin unit tests.
-- Compare all eight critical GhostLock functions against the R2 source built with the identical compiler.
+- Record the unchanged original disassembly gate and compare eight instantiated critical GhostLock functions against the R2 source built with the identical compiler. The original catalog's two multicast worker names are absent in this revision; record their absence and additionally check `tcp_punch_thread` and `do_pselect_fake_lock_route`.
+- Require all 21 unaffected native LLVM IR objects to remain byte-identical, permitting changes only in `ops`, `handoff_probe`, and its `root_child_frontend` caller. Review the original gate's one shape difference only if the relocated read-only eight-byte status constant is independently byte-identical; retain the raw failing report and the explicit reviewed result.
+- Compare the reviewed native executable after the same strip operation with the executable actually packaged in GhostLock.
 - Independently verify final APK v2 signatures/content digests, manifests, DEX/JNI boundaries, embedded LKM and public certificate.
 - Device gate remains pending: cold boot, activation, manager/root apps, ordinary-client driver denial, SELinux Enforcing, saved feature state, repeated stability and detector results. Do not label this gate PASS without user logs.
 
@@ -64,6 +66,6 @@ W1/W2/W3, routes, timings, offsets, all kernel profiles, kernelsnitch, GLK1 wire
 ## Progress
 
 - [x] Review sources and authorization.
-- [ ] Apply and review changes.
+- [x] Apply and review changes.
 - [ ] Complete build verification.
 - [ ] Deliver signed package, key backup, instructions and device-gate checklist.
