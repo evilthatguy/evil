@@ -232,7 +232,16 @@ jobs:
           cat "$RUNNER_TEMP/manager-signature.txt"
           grep -Fq "Verified using v2 scheme (APK Signature Scheme v2): true" "$RUNNER_TEMP/manager-signature.txt"
           grep -Fq "Verified using v3 scheme (APK Signature Scheme v3): false" "$RUNNER_TEMP/manager-signature.txt"
-          grep -Fiq "Signer #1 certificate SHA-256 digest: $CERT_HASH" "$RUNNER_TEMP/manager-signature.txt"
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          report = (Path(os.environ["RUNNER_TEMP"]) / "manager-signature.txt").read_text()
+          certs = re.findall(
+              r"^(?:Signer #\d+|V2 Signer):? certificate SHA-256 digest: ([0-9a-fA-F]{64})$",
+              report, re.MULTILINE)
+          assert len(certs) == 1, "Expected exactly one manager signing certificate"
+          assert certs[0].lower() == os.environ["CERT_HASH"].lower(), "Manager certificate does not match the module"
+          PY
           "$APKSIGNER" verify out/GhostLock-Trial.apk
           "$AAPT" dump badging out/NovaTools.apk > "$RUNNER_TEMP/manager-badging.txt"
           "$AAPT" dump badging out/GhostLock-Trial.apk > "$RUNNER_TEMP/ghost-badging.txt"
