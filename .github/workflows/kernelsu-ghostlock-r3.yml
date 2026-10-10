@@ -53,6 +53,7 @@ jobs:
         with:
           targets: aarch64-linux-android
           toolchain: 1.99.0
+          components: clippy,rustfmt
 
       - uses: nttld/setup-ndk@v1
         id: ndk
@@ -85,6 +86,15 @@ jobs:
           git -C ksu diff --check
           git -C ghost diff --check
           git -C ghost diff --exit-code -- app/src/main/assets/kernel_profiles src/core/kernelsnitch
+
+      - name: Cache the pinned Android Rust build
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ksu/target
+          key: r3-rust199-ndk29-${{ runner.os }}-${{ hashFiles('ksu/Cargo.lock', 'r3/ksu-r3.patch', 'r3/public-certificate.json') }}
 
       - name: Generate a disposable APK build-test key; use the stable final driver certificate
         run: |
