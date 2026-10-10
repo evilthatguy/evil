@@ -74,6 +74,16 @@
      // Get managed features from active modules and skip them during init
      if let Ok(managed_features_map) = crate::module::get_managed_features() {
          if !managed_features_map.is_empty() {
+--- a/userspace/ksud/src/sepolicy.rs
++++ b/userspace/ksud/src/sepolicy.rs
+@@ -1,3 +1,7 @@
++// derive-new 0.7 generates `field: field` in its constructors. Keep this
++// generated-code lint scoped to the policy parser; all other lints stay active.
++#![allow(clippy::redundant_field_names)]
++
+ use anyhow::{Context, Result, bail};
+ use derive_new::new;
+ use nom::{
 --- a/kernel/core/init.c
 +++ b/kernel/core/init.c
 @@ -85,6 +85,7 @@
@@ -84,6 +94,156 @@
  #if defined(__x86_64__) && !defined(CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER)
      // If the kernel has the hardening patch, X86_FEATURE_INDIRECT_SAFE must be set
      if (!boot_cpu_has(X86_FEATURE_INDIRECT_SAFE)) {
+--- a/kernel/selinux/rules.c
++++ b/kernel/selinux/rules.c
+@@ -44,7 +44,7 @@
+ 
+ void apply_kernelsu_rules()
+ {
+-    struct selinux_policy *pol, *old_pol = selinux_state.policy;
++    struct selinux_policy *pol, *old_pol;
+     struct policydb *db;
+ 
+     if (!getenforce()) {
+@@ -52,8 +52,9 @@
+     }
+ 
+     mutex_lock(&selinux_state.policy_mutex);
+-    backup_sepolicy =
+-        ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
++
++    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
++    backup_sepolicy = ksu_dup_sepolicy(old_pol);
+     if (IS_ERR(backup_sepolicy)) {
+         pr_err("failed to create backup sepolicy: %ld\n", PTR_ERR(backup_sepolicy));
+         backup_sepolicy = NULL;
+@@ -75,7 +76,7 @@
+             }
+         }
+     }
+-    pol = ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
++    pol = ksu_dup_sepolicy(old_pol);
+     if (IS_ERR(pol)) {
+         pr_err("failed to dup selinux_policy: %ld\n", PTR_ERR(pol));
+         goto out_unlock;
+@@ -463,8 +464,8 @@
+ 
+     mutex_lock(&selinux_state.policy_mutex);
+ 
+-    old_pol = selinux_state.policy;
+-    pol = ksu_dup_sepolicy(rcu_dereference_protected(old_pol, lockdep_is_held(&selinux_state.policy_mutex)));
++    old_pol = rcu_dereference_protected(selinux_state.policy, lockdep_is_held(&selinux_state.policy_mutex));
++    pol = ksu_dup_sepolicy(old_pol);
+     if (IS_ERR(pol)) {
+         ret = PTR_ERR(pol);
+         pr_err("ksu_dup_sepolicy err: %d\n", ret);
+--- a/kernel/selinux/sepolicy.c
++++ b/kernel/selinux/sepolicy.c
+@@ -81,7 +81,7 @@
+ #define symtab_insert(s, name, datum) hashtab_insert((s)->table, name, datum)
+ #endif
+ 
+-#define avtab_for_each(avtab, cur) ksu_hash_for_each(avtab.htable, avtab.nslot, cur);
++#define avtab_for_each(avtab, cur) ksu_hash_for_each(avtab.htable, avtab.nslot, cur)
+ 
+ static struct avtab_node *get_avtab_node(struct policydb *db, struct avtab_key *key,
+                                          struct avtab_extended_perms *xperms)
+@@ -122,12 +122,12 @@
+         if (!node)
+             return NULL;
+ 
++        // extra size: add_type() can grow policy without updating db->len
+         int grow_size = sizeof(struct avtab_key);
+         grow_size += sizeof(struct avtab_datum);
+         if (key->specified & AVTAB_XPERMS) {
+-            grow_size += sizeof(u8);
+-            grow_size += sizeof(u8);
+-            grow_size += sizeof(u32) * ARRAY_SIZE(avdatum.u.xperms->perms.p);
++            grow_size += sizeof(avdatum.u.xperms->specified) + sizeof(avdatum.u.xperms->driver) +
++                         sizeof(avdatum.u.xperms->perms.p);
+         }
+         db->len += grow_size;
+     }
+@@ -150,7 +150,9 @@
+ {
+     int i;
+     int ret;
+-    int shrink_size = sizeof(struct avtab_key) + sizeof(struct avtab_datum);
++    // https://github.com/torvalds/linux/blob/v6.1/security/selinux/ss/avtab.c#L619
++    int shrink_size = sizeof(node->key.source_type) + sizeof(node->key.target_type) + sizeof(node->key.target_class) +
++                      sizeof(node->key.specified);
+     struct avtab removed = {};
+     struct avtab_node *n;
+     struct avtab_node *prev;
+@@ -173,9 +175,13 @@
+             if (db->te_avtab.nel > 0)
+                 db->te_avtab.nel--;
+ 
+-            if ((n->key.specified & AVTAB_XPERMS) && n->datum.u.xperms) {
+-                shrink_size += sizeof(u8) + sizeof(u8) + sizeof(u32) * ARRAY_SIZE(n->datum.u.xperms->perms.p);
+-            }
++            if (n->key.specified & AVTAB_XPERMS)
++                // specified and driver are u8, perms.p holds 8 u32s
++                shrink_size += sizeof(n->datum.u.xperms->specified) + sizeof(n->datum.u.xperms->driver) +
++                               sizeof(n->datum.u.xperms->perms.p);
++            else
++                // data is u32
++                shrink_size += sizeof(n->datum.u.data);
+             n->next = NULL;
+             removed.htable[0] = n;
+             removed.nel = 1;
+@@ -396,14 +402,9 @@
+         }
+         datum = &node->datum;
+ 
+-        if (datum->u.xperms == NULL) {
+-            datum->u.xperms = (struct avtab_extended_perms *)(kzalloc(sizeof(xperms), GFP_KERNEL));
+-            if (!datum->u.xperms) {
+-                pr_err("alloc xperms failed\n");
+-                return;
+-            }
+-            memcpy(datum->u.xperms, &xperms, sizeof(xperms));
+-        }
++        // Allow updating permission bits of existing xperms
++        for (i = 0; i < ARRAY_SIZE(xperms.perms.p); i++)
++            datum->u.xperms->perms.p[i] |= xperms.perms.p[i];
+     }
+ }
+ 
+@@ -908,10 +909,14 @@
+     void *data;
+     struct policy_file fp;
+ 
+-    len = old_pol->policydb.len;
++    // Some device policy db seems not marking type itself in type_attr_map_array
++    // policydb_read() adds each type to its own attribute map, so old_pol->policydb.len may be smaller
++    // preserve one ebitmap entry for this condition to avoid trigger -EINVAL
++    len = old_pol->policydb.len + (size_t)old_pol->policydb.p_types.nprim * (sizeof(u32) + sizeof(u64));
++
+     data = vmalloc(len);
+     if (!data) {
+-        pr_err("alloc policy len %ld\n", len);
++        pr_err("alloc policy buffer len %zu\n", len);
+         ret = -ENOMEM;
+         goto out_free_data;
+     }
+@@ -924,6 +929,7 @@
+         pr_err("sepolicy: policydb_write: %d\n", ret);
+         goto out_free_data;
+     }
++    len -= fp.len;
+     // https://android.googlesource.com/kernel/common/+/35a7845718734ae638b85b420534cb859498dab6%5E%21
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+     // https://android-review.googlesource.com/c/kernel/common/+/3009995/11/security/selinux/ss/policydb.c
+@@ -961,7 +967,7 @@
+         pr_err("sepolicy: policydb_read: %d\n", ret);
+         goto out_free_policydb;
+     }
+-    new_pol->policydb.len = old_pol->policydb.len;
++    new_pol->policydb.len = len;
+     kvfree(data);
+ 
+     return new_pol;
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
 @@ -83,11 +83,11 @@
@@ -1181,3 +1341,19 @@
      }
      return 0;
  }
+--- a/manager/app/src/main/java/app/nca764574fc/tools/ui/viewmodel/SettingsViewModel.kt
++++ b/manager/app/src/main/java/app/nca764574fc/tools/ui/viewmodel/SettingsViewModel.kt
+@@ -279,8 +279,11 @@
+     fun setSelinuxHideEnabled(enabled: Boolean) {
+         viewModelScope.launch(Dispatchers.IO) {
+             val status = repo.setSelinuxHideEnabled(enabled)
+-            repo.execKsudFeatureSave()
+-            _uiState.update { it.copy(isSelinuxHideEnabled = enabled) }
++            val actualEnabled = repo.isSelinuxHideEnabled()
++            if (status == 0) {
++                repo.execKsudFeatureSave()
++            }
++            _uiState.update { it.copy(isSelinuxHideEnabled = actualEnabled) }
+             when (status) {
+                 0 -> {}
+                 -OsConstants.EAGAIN -> {

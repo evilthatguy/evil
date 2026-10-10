@@ -19,7 +19,10 @@ Preserve the stock kernel, bootloader state, root profiles and GhostLock wire/pr
 - `kernel/manager/{apk_sign,throne_tracker,pkg_observer}.*`, `kernel/include/util.h`, `kernel/Kbuild`, `kernel/supercall/dispatch.c`: selected upstream discovery backports, pinned package and certificate.
 - `kernel/supercall/{supercall,perm}.c`, `internal.h`: authorize before queueing, again before installation, and on each ioctl; preserve stock reboot result for rejected requests.
 - `kernel/feature/selinux_hide.c`: upstream SID and permission-sequence backports; report enabled only after successful hook activation. Guard installed hooks while disabled.
+- `kernel/selinux/{sepolicy,rules}.c`: upstream policy serialization buffer, avtab iteration/length and RCU access corrections required for a reliable policy backup and rule updates.
 - `userspace/ksud/src/feature.rs`: default SELinux hiding on when unset, respecting explicit saved settings and module-managed features; check activation readback.
+- Manager `ui/viewmodel/SettingsViewModel.kt`: refresh the actual SELinux hide state after toggling, and persist it only after successful activation.
+- `userspace/ksud/src/sepolicy.rs`: scope the generated `derive-new` redundant-field-name lint; no parsing or policy behavior change.
 - `ghost/src/core/attack/ops.cpp`: remove `--allow-shell`; check actual enforcing state at handoff. Existing resource ownership and exploit operations stay intact.
 - `ghost/src/core/session/handoff_probe.{cpp,hpp}`, existing `handoff_probe_test.cpp`: require a confirmed enforcing read before reporting ready; a denied read must not count as confirmation.
 - Existing R2 identity patch: R3 labels, coordinated package/JNI/native paths, unchanged identifiers for a one-time signing migration.
