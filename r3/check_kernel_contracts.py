@@ -171,6 +171,43 @@ with tempfile.TemporaryDirectory() as temp:
     subprocess.run(["cc","-std=c11","-Wall","-Wextra","-Werror",str(path),"-o",str(binary)],check=True)
     subprocess.run([str(binary)],check=True)
 
+backup_function = function(selinux, "void ksu_selinux_hide_drop_backup_if_unused(")
+backup_stub = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+#define pr_info(...) ((void)0)
+static int selinux_hide_mutex;
+static void mutex_lock(int *p){(void)p;}
+static void mutex_unlock(int *p){(void)p;}
+static bool ksu_late_loaded, ksu_selinux_hide_running;
+static int destroys, frees, policies;
+static int sidtab;
+static struct policy { void *sidtab; } policy = {&sidtab}, *backup_sepolicy;
+static void sidtab_destroy(void *p){assert(p == &sidtab); ++destroys;}
+static void kfree(void *p){assert(p == &sidtab); ++frees;}
+static void ksu_destroy_sepolicy(struct policy *p){assert(p == &policy); ++policies;}
+'''
+backup_test = r'''
+int main(void) {
+    backup_sepolicy = &policy; ksu_late_loaded = true;
+    ksu_selinux_hide_drop_backup_if_unused();
+    assert(backup_sepolicy == &policy && !destroys && !frees && !policies);
+    ksu_late_loaded = false; ksu_selinux_hide_running = true;
+    ksu_selinux_hide_drop_backup_if_unused();
+    assert(backup_sepolicy == &policy && !destroys && !frees && !policies);
+    ksu_selinux_hide_running = false;
+    ksu_selinux_hide_drop_backup_if_unused();
+    assert(!backup_sepolicy && destroys == 1 && frees == 1 && policies == 1);
+    puts("PASS: disabled late-load retains its policy backup for later activation; early-boot cleanup preserved");
+}
+'''
+with tempfile.TemporaryDirectory() as temp:
+    path=Path(temp)/"backup.c";path.write_text(backup_stub+backup_function+backup_test)
+    binary=Path(temp)/"backup"
+    subprocess.run(["cc","-std=c11","-Wall","-Wextra","-Werror",str(path),"-o",str(binary)],check=True)
+    subprocess.run([str(binary)],check=True)
+
 dispatch = (root / "supercall/dispatch.c").read_text()
 for name in ("GET_INFO", "GET_INFO_LEGACY", "CHECK_SAFEMODE"):
     block=dispatch.split(f'.name = "{name}"',1)[1].split("}",1)[0]
