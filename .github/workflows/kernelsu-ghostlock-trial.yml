@@ -25,6 +25,7 @@ jobs:
       GHOST_COMMIT: 3d4306c1abcf7b17a6e89ca5bc75721f873125c5
       KSU_PACKAGE_NAME: com.nova.toolbox
       KMI: android14-6.1
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
 
     steps:
       - uses: actions/checkout@v7
@@ -50,6 +51,7 @@ jobs:
       - name: Get the pinned original sources
         run: |
           set -euo pipefail
+          git config --global url."https://github.com/KernelSU2/".insteadOf "https://github.com/Kernel-SU/"
           git clone https://github.com/tiann/KernelSU.git ksu
           git -C ksu checkout --detach "$KSU_COMMIT"
           test "$(git -C ksu rev-list --count HEAD)" = 2601
