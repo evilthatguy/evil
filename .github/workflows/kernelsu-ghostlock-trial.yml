@@ -444,9 +444,10 @@ jobs:
                       fallback = ('*/' + PACKAGE + '-*/lib/arm64/libnovabridge.so').encode()
                       assert any(fallback in blob for blob in native_blobs), 'Missing compiled GhostLock fallback'
               report = (OUT / f'{prefix}-signature.txt').read_text()
-              certs = re.findall(r'^(?:Signer #\d+|V2 Signer):? certificate SHA-256 digest: ([0-9a-fA-F]{64})$', report, re.M)
-              assert len(certs) == 1
-              cert = certs[0].lower()
+              certs = {value.lower() for value in re.findall(
+                  r'^(?:Signer #\d+|V\d+(?:\.\d+)* Signer):? certificate SHA-256 digest: ([0-9a-fA-F]{64})$', report, re.M)}
+              assert len(certs) == 1, f'Expected one certificate identity in {prefix} signature report'
+              cert = next(iter(certs))
               assert cert == os.environ['CERT_HASH'].lower()
               assert cert not in KNOWN_CERTS
               return {'package': expected_package, 'application': application, 'zygotePreload': actual_preload,
