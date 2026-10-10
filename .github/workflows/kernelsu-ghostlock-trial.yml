@@ -1,0 +1,258 @@
+name: KernelSU original - GhostLock spoof trial
+
+# One trial build. Signing keys are generated on the runner and are NOT uploaded.
+# A new run uses a new key; uninstall ONLY the two trial apps before installing
+# APKs from a different run. Keep the original apps installed.
+on:
+  push:
+    branches: [ksu-ghostlock-spoof-trial]
+    paths:
+      - '.github/workflows/kernelsu-ghostlock-trial.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      KSU_COMMIT: 932014ab5b2c9b74a3d11e2ec4d17dd10fc9442e
+      GHOST_COMMIT: 3d4306c1abcf7b17a6e89ca5bc75721f873125c5
+      KSU_PACKAGE_NAME: com.nova.toolbox
+      KMI: android14-6.1
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v4
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r29
+
+      - name: Get the pinned original sources
+        run: |
+          set -euo pipefail
+          git clone https://github.com/tiann/KernelSU.git ksu
+          git -C ksu checkout --detach "$KSU_COMMIT"
+          test "$(git -C ksu rev-list --count HEAD)" = 2601
+          git clone https://github.com/YuKongA/ghostlock-app.git ghost
+          git -C ghost checkout --detach "$GHOST_COMMIT"
+          test "$(git -C ghost rev-list --count HEAD)" = 564
+          test -f ghost/app/src/main/assets/kernel_profiles/6.1.145-android14-11-g11c274d0441f-ab14259673.conf
+
+      - name: Patch only app identity and manager discovery
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              t = p.read_text()
+              if t.count(old) != 1:
+                  raise RuntimeError(f"Source mismatch in {path}: {old!r}")
+              p.write_text(t.replace(old, new, 1))
+
+          # This device is arm64; the original namespace remains unchanged.
+          replace_once("ksu/manager/app/build.gradle.kts",
+                       'abiFilters += listOf("arm64-v8a", "x86_64")',
+                       'abiFilters += listOf("arm64-v8a")')
+
+          # The trial GhostLock must use only the trial manager's ksud.
+          p = Path("ghost/app/src/main/kotlin/com/ghostlock/app/data/AndroidGhostlockRepository.kt")
+          t = p.read_text()
+          old = 'val packages = listOf("me.weishu.kernelsu.pr", "me.weishu.kernelsu", "com.resukisu.resukisu", "com.kowx712.supermanager")'
+          if t.count(old) != 1:
+              raise RuntimeError("GhostLock package discovery source mismatch")
+          p.write_text(t.replace(old, 'val packages = listOf("com.nova.toolbox")', 1))
+
+          replace_once("ghost/app/src/main/AndroidManifest.xml",
+                       "<queries>",
+                       '<queries>\n        <package android:name="com.nova.toolbox" />')
+          replace_once("ghost/app/src/main/AndroidManifest.xml",
+                       'android:label="@string/app_name"',
+                       'android:label="GhostLock Trial"')
+          replace_once("ghost/app/build.gradle.kts",
+                       'applicationId = "com.ghostlock.app"',
+                       'applicationId = "com.ghostlock.trial"')
+
+          # Keep the proven native payload and late-load logic. Restrict its
+          # emergency ksud discovery to the same trial package.
+          p = Path("ghost/src/core/attack/ops.cpp")
+          t = p.read_text()
+          start_marker = r'            "if [ ! -x \"$KSUD\" ]; then\n"'
+          end_marker = r'            "echo \"[*] ksud=$KSUD\" >>\"$LOG\"\n"'
+          start = t.index(start_marker)
+          end = t.index(end_marker, start)
+          section = t[start:end]
+          blocks = section.splitlines(keepends=True)
+          if len(blocks) != 14 or "me.weishu.kernelsu.pr" not in blocks[1]:
+              raise RuntimeError("GhostLock native ksud discovery source mismatch")
+          replacement = "".join(blocks[:3]).replace(
+              "*/me.weishu.kernelsu.pr*/lib/arm64/libksud.so",
+              "*/com.nova.toolbox-*/lib/arm64/libksud.so")
+          p.write_text(t[:start] + replacement + t[end:])
+          PY
+
+      - name: Generate a trial signing key and its public certificate
+        run: |
+          set -euo pipefail
+          TRIAL_PASSWORD=$(openssl rand -hex 24)
+          echo "::add-mask::$TRIAL_PASSWORD"
+          echo "TRIAL_PASSWORD=$TRIAL_PASSWORD" >> "$GITHUB_ENV"
+          keytool -genkeypair -noprompt -alias trial \
+            -keyalg RSA -keysize 2048 -validity 3650 -storetype JKS \
+            -dname "CN=Nova Tools Trial" \
+            -keystore "$RUNNER_TEMP/trial.jks" \
+            -storepass "$TRIAL_PASSWORD" -keypass "$TRIAL_PASSWORD"
+          keytool -exportcert -alias trial -keystore "$RUNNER_TEMP/trial.jks" \
+            -storepass "$TRIAL_PASSWORD" -file "$RUNNER_TEMP/trial-cert.der"
+          CERT_SIZE=$(stat -c%s "$RUNNER_TEMP/trial-cert.der")
+          test "$CERT_SIZE" -le 1024
+          echo "CERT_SIZE=$CERT_SIZE" >> "$GITHUB_ENV"
+          echo "CERT_HASH=$(sha256sum "$RUNNER_TEMP/trial-cert.der" | cut -d ' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Build the matching original KernelSU module
+        run: |
+          set -euo pipefail
+          docker run --rm --privileged \
+            -v "$GITHUB_WORKSPACE/ksu:/src" -w /src/kernel \
+            -e CERT_SIZE -e CERT_HASH -e KSU_PACKAGE_NAME \
+            --entrypoint /bin/bash \
+            ghcr.io/ylarod/ddk-min:android14-6.1-20260828 \
+            -lc 'set -euo pipefail
+              git config --global --add safe.directory /src
+              CONFIG_KSU=m CC=clang make \
+                KSU_EXPECTED_SIZE="$CERT_SIZE" \
+                KSU_EXPECTED_HASH="$CERT_HASH" \
+                KSU_MANAGER_PACKAGE="$KSU_PACKAGE_NAME"
+              llvm-strip -d kernelsu.ko
+              cp kernelsu.ko /src/userspace/ksud/bin/aarch64/android14-6.1_kernelsu.ko'
+          # The container writes as root. Only this temporary checkout is adjusted.
+          sudo chown -R "$(id -u):$(id -g)" ksu
+
+      - name: Build original ksuinit and ksud with the matching module embedded
+        working-directory: ksu
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          BUILTINS="$("$CLANG_PATH" --print-resource-dir)/lib/linux/libclang_rt.builtins-aarch64-android.a"
+          test -f "$BUILTINS"
+          RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS" \
+            cargo build --locked --package ksuinit --target aarch64-linux-android --release
+          cp target/aarch64-linux-android/release/ksuinit userspace/ksud/bin/aarch64/
+          cargo build --locked --target aarch64-linux-android --release \
+            --manifest-path userspace/ksud/Cargo.toml
+
+      - name: Build and repack the original manager with a different package and label
+        working-directory: ksu
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          sdkmanager "platforms;android-37" "build-tools;37.0.0" "cmake;3.22.1"
+          cp "$RUNNER_TEMP/trial.jks" manager/trial.jks
+          {
+            echo "KEYSTORE_FILE=trial.jks"
+            echo "KEYSTORE_PASSWORD=$TRIAL_PASSWORD"
+            echo "KEY_ALIAS=trial"
+            echo "KEY_PASSWORD=$TRIAL_PASSWORD"
+          } >> manager/gradle.properties
+          chmod +x manager/gradlew
+          (cd manager && ./gradlew assembleRelease --no-daemon \
+            -PKSU_PACKAGE_NAME=com.nova.toolbox -PKSU_NAME="Nova Tools")
+          python3 repack_apk.py repack -b release -t release \
+            -a arm64-v8a -n NovaTools \
+            -K "$RUNNER_TEMP/trial.jks" -A trial \
+            -P "$TRIAL_PASSWORD" -S "$TRIAL_PASSWORD" --strip
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp dist/NovaTools.apk "$GITHUB_WORKSPACE/out/NovaTools.apk"
+
+      - name: Get the same GhostLock compiler toolchain
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 \
+            https://github.com/topjohnwu/ondk/releases/download/r30.1/ondk-r30.1-linux.tar.xz \
+            -o "$RUNNER_TEMP/ondk.tar.xz"
+          mkdir -p "$RUNNER_TEMP/ondk"
+          tar -C "$RUNNER_TEMP/ondk" --strip-components=1 -xf "$RUNNER_TEMP/ondk.tar.xz"
+          rustup toolchain link ondk "$RUNNER_TEMP/ondk/toolchains/rust"
+
+      - name: Build the separate GhostLock trial app
+        working-directory: ghost
+        run: |
+          set -euo pipefail
+          export ONDK_HOME="$RUNNER_TEMP/ondk"
+          export ANDROID_NDK_HOME="$ONDK_HOME"
+          export NDK_ROOT="$ONDK_HOME"
+          export KEYSTORE_PATH="$RUNNER_TEMP/trial.jks"
+          export KEYSTORE_PASS="$TRIAL_PASSWORD"
+          export KEY_ALIAS=trial
+          export KEY_PASSWORD="$TRIAL_PASSWORD"
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --no-daemon
+          mapfile -t APKS < <(find build/app/outputs/apk/release -maxdepth 1 -name '*.apk')
+          test "${#APKS[@]}" = 1
+          cp "${APKS[0]}" "$GITHUB_WORKSPACE/out/GhostLock-Trial.apk"
+
+      - name: Verify manager signature and APK identities
+        run: |
+          set -euo pipefail
+          APKSIGNER="$ANDROID_HOME/build-tools/37.0.0/apksigner"
+          AAPT="$ANDROID_HOME/build-tools/37.0.0/aapt"
+          "$APKSIGNER" verify --verbose --print-certs out/NovaTools.apk > "$RUNNER_TEMP/manager-signature.txt"
+          cat "$RUNNER_TEMP/manager-signature.txt"
+          grep -Fq "Verified using v2 scheme (APK Signature Scheme v2): true" "$RUNNER_TEMP/manager-signature.txt"
+          grep -Fq "Verified using v3 scheme (APK Signature Scheme v3): false" "$RUNNER_TEMP/manager-signature.txt"
+          grep -Fiq "Signer #1 certificate SHA-256 digest: $CERT_HASH" "$RUNNER_TEMP/manager-signature.txt"
+          "$APKSIGNER" verify out/GhostLock-Trial.apk
+          "$AAPT" dump badging out/NovaTools.apk > "$RUNNER_TEMP/manager-badging.txt"
+          "$AAPT" dump badging out/GhostLock-Trial.apk > "$RUNNER_TEMP/ghost-badging.txt"
+          grep -Fq "package: name='com.nova.toolbox'" "$RUNNER_TEMP/manager-badging.txt"
+          grep -Fq "package: name='com.ghostlock.trial'" "$RUNNER_TEMP/ghost-badging.txt"
+          python3 - <<'PY'
+          from zipfile import ZipFile
+          with ZipFile("out/NovaTools.apk") as z:
+              ksud = z.read("lib/arm64-v8a/libksud.so")
+              assert b"android14-6.1_kernelsu.ko" in ksud, "Embedded module is missing"
+              assert b"com.nova.toolbox" in ksud, "ksud package setting is missing"
+          PY
+          cp "$RUNNER_TEMP/manager-signature.txt" out/manager-signature.txt
+          cp "$RUNNER_TEMP/trial-cert.der" out/manager-public-cert.der
+          {
+            echo "KernelSU=$KSU_COMMIT"
+            echo "GhostLock=$GHOST_COMMIT"
+            echo "KMI=$KMI"
+            echo "ManagerPackage=$KSU_PACKAGE_NAME"
+            echo "CertificateSHA256=$CERT_HASH"
+            echo "CertificateSize=$CERT_SIZE"
+            echo "Validation=build and signature; device runtime not tested"
+          } > out/build-info.txt
+          (cd out && sha256sum NovaTools.apk GhostLock-Trial.apk > SHA256SUMS.txt)
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: KernelSU-GhostLock-Trial
+          path: out/
+          retention-days: 7
+
