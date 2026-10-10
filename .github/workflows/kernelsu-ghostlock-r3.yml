@@ -1,0 +1,429 @@
+name: KernelSU original - GhostLock hardening R3
+
+# Original KernelSU with coordinated manager identity and GhostLock discovery.
+# Final private signing key stays outside this public repository and CI.
+# CI APKs use a temporary test key and require final local signing before installation.
+on:
+  push:
+    branches: [ksu-ghostlock-r3]
+    paths:
+      - '.github/workflows/kernelsu-ghostlock-r3.yml'
+      - 'r3/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      KSU_COMMIT: 932014ab5b2c9b74a3d11e2ec4d17dd10fc9442e
+      GHOST_COMMIT: 3d4306c1abcf7b17a6e89ca5bc75721f873125c5
+      KSU_PACKAGE_NAME: app.nca764574fc.tools
+      KMI: android14-6.1
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v4
+
+      - name: Install and inventory the required Android SDK
+        run: |
+          set -euo pipefail
+          sdkmanager --list --channel=3 > "$RUNNER_TEMP/sdk-packages.txt"
+          grep -E 'platforms;|build-tools;|cmake;' "$RUNNER_TEMP/sdk-packages.txt"
+          sdkmanager --channel=3 "platforms;android-37.0" "platforms;android-37.2" "build-tools;37.0.0" "cmake;3.22.1"
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r29
+
+      - name: Get the pinned original sources
+        run: |
+          set -euo pipefail
+          git config --global url."https://github.com/KernelSU2/".insteadOf "https://github.com/Kernel-SU/"
+          git clone https://github.com/tiann/KernelSU.git ksu
+          git -C ksu checkout --detach "$KSU_COMMIT"
+          test "$(git -C ksu rev-list --count HEAD)" = 2601
+          git clone https://github.com/YuKongA/ghostlock-app.git ghost
+          git -C ghost checkout --detach "$GHOST_COMMIT"
+          test "$(git -C ghost rev-list --count HEAD)" = 564
+          test -f ghost/app/src/main/assets/kernel_profiles/6.1.145-android14-11-g11c274d0441f-ab14259673.conf
+
+      - name: Apply the reviewed R3 patches to the working R2 baseline
+        run: |
+          set -euo pipefail
+          python3 r3/patch_identity.py
+          cp -a ghost ghost-r2-baseline
+          git -C ksu apply --check ../r3/ksu-r3.patch
+          git -C ksu apply ../r3/ksu-r3.patch
+          git -C ghost apply --check ../r3/ghost-r3.patch
+          git -C ghost apply ../r3/ghost-r3.patch
+          mkdir -p out
+          python3 r3/check_kernel_contracts.py | tee out/kernel-contracts.txt
+          git -C ksu diff --check
+          git -C ghost diff --check
+          git -C ghost diff --exit-code -- app/src/main/assets/kernel_profiles src/core/kernelsnitch
+
+      - name: Generate a disposable APK build-test key; use the stable final driver certificate
+        run: |
+          set -euo pipefail
+          TRIAL_PASSWORD=$(openssl rand -hex 24)
+          echo "::add-mask::$TRIAL_PASSWORD"
+          echo "TRIAL_PASSWORD=$TRIAL_PASSWORD" >> "$GITHUB_ENV"
+          keytool -genkeypair -noprompt -alias trial \
+            -keyalg RSA -keysize 2048 -validity 3650 -storetype JKS \
+            -dname "CN=Nova Tools Trial" \
+            -keystore "$RUNNER_TEMP/trial.jks" \
+            -storepass "$TRIAL_PASSWORD" -keypass "$TRIAL_PASSWORD"
+          keytool -exportcert -alias trial -keystore "$RUNNER_TEMP/trial.jks" \
+            -storepass "$TRIAL_PASSWORD" -file "$RUNNER_TEMP/trial-cert.der"
+          CERT_SIZE=$(stat -c%s "$RUNNER_TEMP/trial-cert.der")
+          test "$CERT_SIZE" -le 1024
+          echo "CI_CERT_HASH=$(sha256sum "$RUNNER_TEMP/trial-cert.der" | cut -d ' ' -f1)" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64, hashlib, json, os
+          metadata = json.loads(Path('r3/public-certificate.json').read_text())
+          der = base64.b64decode(metadata['certificateBase64'], validate=True)
+          assert len(der) == metadata['certificateSize']
+          assert hashlib.sha256(der).hexdigest() == metadata['certificateSHA256']
+          Path('out/manager-public-cert.der').write_bytes(der)
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write(f"CERT_SIZE={len(der)}\nCERT_HASH={metadata['certificateSHA256']}\n")
+          PY
+
+      - name: Build the matching original KernelSU module
+        run: |
+          set -euo pipefail
+          docker run --rm --privileged \
+            -v "$GITHUB_WORKSPACE/ksu:/src" -w /src/kernel \
+            -e CERT_SIZE -e CERT_HASH -e KSU_PACKAGE_NAME \
+            --entrypoint /bin/bash \
+            ghcr.io/ylarod/ddk-min:android14-6.1-20260828 \
+            -lc 'set -euo pipefail
+              git config --global --add safe.directory /src
+              CONFIG_KSU=m CC=clang make \
+                KSU_EXPECTED_SIZE="$CERT_SIZE" \
+                KSU_EXPECTED_HASH="$CERT_HASH" \
+                KSU_PACKAGE_NAME="$KSU_PACKAGE_NAME" CONFIG_KSU_DEBUG=n
+              llvm-strip -d kernelsu.ko
+              llvm-readelf -h kernelsu.ko | grep -q 'AArch64'
+              ! llvm-nm kernelsu.ko | grep -q '__ksu_debug' 
+              cp kernelsu.ko /src/userspace/ksud/bin/aarch64/android14-6.1_kernelsu.ko'
+          # The container writes as root. Only this temporary checkout is adjusted.
+          sudo chown -R "$(id -u):$(id -g)" ksu
+          cp ksu/kernel/kernelsu.ko out/android14-6.1_kernelsu.ko
+
+      - name: Build original ksuinit and ksud with the matching module embedded
+        working-directory: ksu
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          BUILTINS="$("$CLANG_PATH" --print-resource-dir)/lib/linux/libclang_rt.builtins-aarch64-android.a"
+          test -f "$BUILTINS"
+          RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wno-unused-command-line-argument -C link-arg=$BUILTINS" \
+            cargo build --locked --package ksuinit --target aarch64-linux-android --release
+          cp target/aarch64-linux-android/release/ksuinit userspace/ksud/bin/aarch64/
+          cargo build --locked --target aarch64-linux-android --release \
+            --manifest-path userspace/ksud/Cargo.toml
+
+      - name: Check Android Rust, lint and formatting
+        working-directory: ksu
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          cargo install cargo-ndk --locked
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          cargo ndk -t arm64-v8a check --locked --manifest-path userspace/ksud/Cargo.toml
+          cargo ndk -t arm64-v8a clippy --locked --manifest-path userspace/ksud/Cargo.toml -- -D warnings
+          cargo fmt --manifest-path userspace/ksud/Cargo.toml
+          cargo fmt --manifest-path userspace/ksud/Cargo.toml -- --check
+
+      - name: Build and repack the original manager with a different package and label
+        working-directory: ksu
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/trial.jks" manager/trial.jks
+          {
+            echo "KEYSTORE_FILE=trial.jks"
+            echo "KEYSTORE_PASSWORD=$TRIAL_PASSWORD"
+            echo "KEY_ALIAS=trial"
+            echo "KEY_PASSWORD=$TRIAL_PASSWORD"
+          } >> manager/gradle.properties
+          chmod +x manager/gradlew
+          (cd manager && ./gradlew assembleRelease --no-daemon \
+            -PKSU_PACKAGE_NAME=app.nca764574fc.tools -PKSU_NAME="Nova Tools R3")
+          python3 repack_apk.py repack -b release -t release \
+            -a arm64-v8a -n NovaToolsR3 \
+            -K "$RUNNER_TEMP/trial.jks" -A trial \
+            -P "$TRIAL_PASSWORD" -S "$TRIAL_PASSWORD" --strip
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp dist/NovaToolsR3.apk "$GITHUB_WORKSPACE/out/NovaToolsR3.build.apk"
+
+      - name: Get the same GhostLock compiler toolchain
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 \
+            https://github.com/topjohnwu/ondk/releases/download/r30.1/ondk-r30.1-linux.tar.xz \
+            -o "$RUNNER_TEMP/ondk.tar.xz"
+          mkdir -p "$RUNNER_TEMP/ondk"
+          tar -C "$RUNNER_TEMP/ondk" --strip-components=1 -xf "$RUNNER_TEMP/ondk.tar.xz"
+          rustup toolchain link ondk "$RUNNER_TEMP/ondk/toolchains/rust"
+
+      - name: Verify ARM host tests, native warnings, lint and exploit function shapes
+        run: |
+          set -euo pipefail
+          export NDK_ROOT="$RUNNER_TEMP/ondk"
+          export ANDROID_NDK_HOME="$NDK_ROOT"
+          sudo apt-get update -qq
+          sudo apt-get install -y g++-aarch64-linux-gnu qemu-user
+          chmod +x r3/host-compiler.py
+          HOST_COMPILER="$GITHUB_WORKSPACE/r3/host-compiler.py"
+          make -C ghost/src native-host-tests host-attack-dataflow-test -j2 \
+            HOST_CXX="$HOST_COMPILER" HOST_CC="env R3_HOST_COMPILER=aarch64-linux-gnu-gcc $HOST_COMPILER" \
+            2>&1 | tee out/ghost-host-tests.txt
+          make -C ghost-r2-baseline/src ghostlock -j2 2>&1 | tee out/ghost-baseline-build.txt
+          make -C ghost/src ghostlock -j2 2>&1 | tee out/ghost-native-build.txt
+          ! grep -E '(^| )warning:|(^| )error:' out/ghost-native-build.txt
+          make -C ghost/src lint-tidy 2>&1 | tee out/ghost-clang-tidy.txt
+          LLVM_OBJDUMP="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objdump" \
+            python3 ghost/tools/cmp_disasm.py ghost-r2-baseline/build/native/ghostlock ghost/build/native/ghostlock \
+            | tee out/ghost-disassembly-review.txt
+          sha256sum ghost-r2-baseline/build/native/ghostlock ghost/build/native/ghostlock \
+            > out/ghost-native-baselines.txt
+          cp "$ANDROID_HOME/build-tools/37.0.0/lib/apksigner.jar" out/apksigner.jar
+
+      - name: Build the separate GhostLock trial app
+        working-directory: ghost
+        run: |
+          set -euo pipefail
+          export ONDK_HOME="$RUNNER_TEMP/ondk"
+          export ANDROID_NDK_HOME="$ONDK_HOME"
+          export NDK_ROOT="$ONDK_HOME"
+          export KEYSTORE_PATH="$RUNNER_TEMP/trial.jks"
+          export KEYSTORE_PASS="$TRIAL_PASSWORD"
+          export KEY_ALIAS=trial
+          export KEY_PASSWORD="$TRIAL_PASSWORD"
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest :app:assembleRelease --no-daemon
+          mapfile -t APKS < <(find build/app/outputs/apk/release -maxdepth 1 -name '*.apk')
+          test "${#APKS[@]}" = 1
+          cp "${APKS[0]}" "$GITHUB_WORKSPACE/out/GhostLock-TrialR3.build.apk"
+
+      - name: Verify signatures and the compiled APK identity boundaries
+        run: |
+          set -euo pipefail
+          APKSIGNER="$ANDROID_HOME/build-tools/37.0.0/apksigner"
+          AAPT="$ANDROID_HOME/build-tools/37.0.0/aapt"
+          ANALYZER="$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer"
+          "$APKSIGNER" verify --verbose --print-certs out/NovaToolsR3.build.apk > out/manager-signature.txt
+          "$APKSIGNER" verify --verbose --print-certs out/GhostLock-TrialR3.build.apk > out/ghost-signature.txt
+          grep -Fq "Verified using v2 scheme (APK Signature Scheme v2): true" out/manager-signature.txt
+          grep -Fq "Verified using v3 scheme (APK Signature Scheme v3): false" out/manager-signature.txt
+          "$AAPT" dump badging out/NovaToolsR3.build.apk > out/manager-badging.txt
+          "$AAPT" dump badging out/GhostLock-TrialR3.build.apk > out/ghost-badging.txt
+          "$ANALYZER" manifest print out/NovaToolsR3.build.apk > out/manager-manifest.xml
+          "$ANALYZER" manifest print out/GhostLock-TrialR3.build.apk > out/ghost-manifest.xml
+          cp "$RUNNER_TEMP/trial-cert.der" out/ci-build-test-cert.der
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          import hashlib
+          import json
+          import os
+          import re
+          import struct
+          import xml.etree.ElementTree as ET
+          
+          PACKAGE = os.environ['KSU_PACKAGE_NAME']
+          OUT = Path('out')
+          ANDROID = '{http://schemas.android.com/apk/res/android}'
+          # Union of the public RootManagerCatalog anchors: passing this stricter union
+          # means neither APK matches any field in any catalog family.
+          KNOWN_PACKAGES = ('me.weishu.kernelsu', 'io.github.a13e300.mksu', 'com.rifsxd.ksunext',
+                            'com.sukisu.ultra', 'com.resukisu.resukisu', 'me.bmax.apatch',
+                            'com.linux.permissionmanager', 'com.topjohnwu.magisk', 'io.github.vvb2060.magisk')
+          KNOWN_NAMESPACES = KNOWN_PACKAGES + ('org.bakasu.bakasu',)
+          KNOWN_PAYLOADS = {'libksud.so', 'libapd.so', 'libkptools.so', 'libkpatch.so',
+                            'libmagisk.so', 'libmagiskinit.so'}
+          KNOWN_LABELS = ('KernelSU', 'SukiSU', 'ReSukiSU', 'BakaSU', 'APatch', 'SKRoot', 'Magisk')
+          KNOWN_CERTS = {
+              'c371061b19d8c7d7d6133c6a9bafe198fa944e50c1b31c9d8daa8d7f1fc2d2d6',
+              '484fcba6e6c43b1fb09700633bf2fb4758f13cb0b2f4457b80d075084b26c588',
+              '79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7',
+              '947ae944f3de4ed4c21a7e4f7953ecf351bfa2b36239da37a34111ad29993eef',
+              'd3469712b6214462764a1d8d3e5cbe1d6819a0b629791b9f4101867821f1df64',
+          }
+          
+          def under(name, prefix):
+              return name == prefix or name.startswith(prefix + '.')
+          
+          def dex_strings(data):
+              assert data.startswith(b'dex\n'), 'Invalid DEX'
+              count, offset = struct.unpack_from('<II', data, 56)
+              strings = set()
+              for index in range(count):
+                  pos = struct.unpack_from('<I', data, offset + index * 4)[0]
+                  # Skip the UTF-16 length encoded as ULEB128; anchors are ASCII.
+                  while data[pos] & 128:
+                      pos += 1
+                  pos += 1
+                  strings.add(data[pos:data.index(0, pos)])
+              return strings
+          
+          def check_apk(file, prefix, expected_package, expected_application, expected_activity, preload=None):
+              root = ET.parse(OUT / f'{prefix}-manifest.xml').getroot()
+              assert root.get('package') == expected_package
+              assert not any(under(expected_package, p) for p in KNOWN_PACKAGES)
+              app = root.find('application')
+              assert app is not None
+              def qualify(name):
+                  if not name:
+                      return name
+                  return expected_package + name if name.startswith('.') else name
+              application = qualify(app.get(ANDROID + 'name'))
+              actual_preload = qualify(app.get(ANDROID + 'zygotePreloadName'))
+              assert application == expected_application
+              assert actual_preload == preload
+              launchers = []
+              for activity in list(app.findall('activity')) + list(app.findall('activity-alias')):
+                  for intent in activity.findall('intent-filter'):
+                      actions = {e.get(ANDROID + 'name') for e in intent.findall('action')}
+                      categories = {e.get(ANDROID + 'name') for e in intent.findall('category')}
+                      if 'android.intent.action.MAIN' in actions and 'android.intent.category.LAUNCHER' in categories:
+                          launchers.append(qualify(activity.get(ANDROID + 'name')))
+              assert launchers == [expected_activity], launchers
+              for name in (application, actual_preload, *launchers):
+                  if not name:
+                      continue
+                  assert not any(under(name, p) for p in KNOWN_NAMESPACES), name
+              assert not application.endswith(('.KernelSUApplication', '.APApplication'))
+              assert not (actual_preload or '').endswith('.magica.AppZygotePreload')
+              assert not any(name.endswith(('.ui.MainActivity', '.MainActivity')) for name in launchers)
+              labels = re.findall(r"^application-label[^:]*:'(.*)'$", (OUT / f'{prefix}-badging.txt').read_text(), re.M)
+              assert labels and all(not label.startswith(KNOWN_LABELS) for label in labels)
+              with ZipFile(OUT / file) as z:
+                  assert z.testzip() is None
+                  names = z.namelist()
+                  payloads = {Path(n).name for n in names if n.startswith('lib/')}
+                  assert not payloads.intersection(KNOWN_PAYLOADS), payloads
+                  strings = set()
+                  for n in names:
+                      if re.fullmatch(r'classes\d*\.dex', n):
+                          strings.update(dex_strings(z.read(n)))
+                  for component in (application, actual_preload, *launchers):
+                      if component:
+                          descriptor = ('L' + component.replace('.', '/') + ';').encode()
+                          assert descriptor in strings, f'Missing compiled class: {component}'
+                  if prefix == 'manager':
+                      assert app.get(ANDROID + 'extractNativeLibs') == 'true'
+                      assert {'libnovabridge.so', 'libnovacore.so', 'libnovalink.so'} <= payloads
+                      daemon = z.read('lib/arm64-v8a/libnovabridge.so')
+                      native = z.read('lib/arm64-v8a/libnovacore.so')
+                      assert b'android14-6.1_kernelsu.ko' in daemon
+                      assert PACKAGE.encode() in daemon
+                      assert (PACKAGE + '.ui.DashboardActivity').encode() in daemon
+                      for symbol in ('_Natives_getVersion', '_magica_RuntimePreload_forkDontCareAndExecKsud'):
+                          assert ('Java_' + PACKAGE.replace('.', '_') + symbol).encode() in native
+                      assert (PACKAGE.replace('.', '/') + '/Natives$Profile').encode() in native
+                      assert b'Java_me_weishu_kernelsu' not in native
+                      assert b'me/weishu/kernelsu' not in native
+                      for old in (b'me.weishu.kernelsu', b'me/weishu/kernelsu', b'KernelSUApplication',
+                                  b'AppZygotePreload', b'libksud.so'):
+                          assert not any(old in value for value in strings), old
+                  else:
+                      assert PACKAGE.encode() in strings
+                      assert b'libnovabridge.so' in strings
+                      assert b'libksud.so' not in strings
+                      queries = {p.get(ANDROID + 'name') for p in root.findall('queries/package')}
+                      assert PACKAGE in queries
+                      assert not any(p in queries for p in KNOWN_PACKAGES)
+                      native_blobs = [z.read(n) for n in names if n.startswith('lib/') and n.endswith('.so')]
+                      fallback = ('*/' + PACKAGE + '-*/lib/arm64/libnovabridge.so').encode()
+                      assert any(fallback in blob for blob in native_blobs), 'Missing compiled GhostLock fallback'
+              report = (OUT / f'{prefix}-signature.txt').read_text()
+              certs = {value.lower() for value in re.findall(
+                  r'^(?:Signer #\d+|V\d+(?:\.\d+)* Signer):? certificate SHA-256 digest: ([0-9a-fA-F]{64})$', report, re.M)}
+              assert len(certs) == 1, f'Expected one certificate identity in {prefix} signature report'
+              cert = next(iter(certs))
+              assert cert == os.environ['CI_CERT_HASH'].lower()
+              assert cert not in KNOWN_CERTS
+              return {'package': expected_package, 'application': application, 'zygotePreload': actual_preload,
+                      'launcher': launchers[0], 'nativeLibraries': sorted(payloads), 'certificateSHA256': cert,
+                      'catalogIdentityAnchorMatches': 0}
+          
+          results = {
+              'manager': check_apk('NovaToolsR3.build.apk', 'manager', PACKAGE, PACKAGE + '.RuntimeApplication',
+                                   PACKAGE + '.ui.DashboardActivity', PACKAGE + '.magica.RuntimePreload'),
+              'ghost': check_apk('GhostLock-TrialR3.build.apk', 'ghost', 'com.ghostlock.trial',
+                                 'com.ghostlock.app.GhostlockApplication', 'com.ghostlock.app.ui.ControlActivity'),
+          }
+          module = Path('ksu/kernel/kernelsu.ko').read_bytes()
+          assert os.environ['CERT_HASH'].encode() in module, 'Module signing whitelist mismatch'
+          assert PACKAGE.encode() in module, 'Module manager package mismatch'
+          assert hashlib.sha256((OUT / 'manager-public-cert.der').read_bytes()).hexdigest() == os.environ['CERT_HASH']
+          results['scope'] = 'Static identity and native build checks. APKs use a disposable test certificate and MUST be signed locally with the final private key before installation. Device validation remains pending.'
+          (OUT / 'ci-identity-review.json').write_text(json.dumps(results, indent=2) + '\n')
+          print(json.dumps(results, indent=2))
+          PY
+          {
+            echo "KernelSU=$KSU_COMMIT"
+            echo "GhostLock=$GHOST_COMMIT"
+            echo "Device=REDMAGIC Nova NP03J"
+            echo "Kernel=6.1.145-android14-11-g11c274d0441f-ab14259673"
+            echo "KMI=$KMI"
+            echo "ManagerPackage=$KSU_PACKAGE_NAME"
+            echo "CertificateSHA256=$CERT_HASH"
+            echo "CertificateSize=$CERT_SIZE"
+            echo "StaticAPKIdentityChecks=PASS"
+            echo "Validation=build, signature, compiled Manifest, DEX, JNI, payload and GhostLock discovery; device runtime and complete root hiding not tested"
+            echo "ModuleSHA256=$(sha256sum ksu/kernel/kernelsu.ko | cut -d ' ' -f1)"
+            echo "R3PatchSHA256=$(sha256sum r3/ksu-r3.patch | cut -d ' ' -f1)"
+            echo "GhostR3PatchSHA256=$(sha256sum r3/ghost-r3.patch | cut -d ' ' -f1)"
+            echo "FinalSigning=required locally; CI build APK certificates intentionally differ from the driver certificate"
+          } > out/build-info.txt
+          cp r3/R3-PLAN.md out/
+          cp r3/ksu-r3.patch r3/ghost-r3.patch out/
+          printf '%s\n' 'BUILD-TEST APKs: DO NOT INSTALL. Final signing is required.' > out/DO-NOT-INSTALL-CI-APKS.txt
+          (cd out && sha256sum NovaToolsR3.build.apk GhostLock-TrialR3.build.apk android14-6.1_kernelsu.ko > BUILD_SHA256SUMS.txt)
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: KernelSU-GhostLock-R3-Build
+          path: out/
+          retention-days: 30
+
+
+
+      - name: Preserve public build diagnostics if verification fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: KernelSU-GhostLock-R3-Diagnostics
+          path: out/
+          retention-days: 3
+          if-no-files-found: ignore

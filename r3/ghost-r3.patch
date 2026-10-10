@@ -1,0 +1,110 @@
+--- a/src/core/session/handoff_probe.hpp
++++ b/src/core/session/handoff_probe.hpp
+@@ -14,7 +14,7 @@
+         bool enforce_ok = false;
+ 
+         [[nodiscard]] bool ready() const noexcept {
+-            return module_visible || ksu_log_loaded;
++            return (module_visible || ksu_log_loaded) && enforce_ok && !ksu_log_failed;
+         }
+     };
+ 
+--- a/src/core/session/handoff_probe.cpp
++++ b/src/core/session/handoff_probe.cpp
+@@ -44,11 +44,10 @@
+             return true;
+         }
+ 
+-        /* Module init re-enforces at the very end of kernelsu_init; a denied read or
+- * the value '1' both mean enforcing here. */
++        /* Confirm the value; an unavailable read cannot establish enforcement. */
+         bool read_enforce_enforcing() noexcept {
+             support::UniqueFd fd(open("/sys/fs/selinux/enforce", O_RDONLY | O_CLOEXEC));
+-            if (!fd.valid()) return true;
++            if (!fd.valid()) return false;
+             std::array < char, 4 > buffer{};
+             const ssize_t n = read(fd.get(), buffer.data(), buffer.size());
+             return n > 0 && buffer[0] == '1';
+@@ -118,7 +117,7 @@
+         }
+ 
+         for (uint32_t i = 0;
+-             result.ksu_log_loaded && !result.enforce_ok &&
++             (result.module_visible || result.ksu_log_loaded) && !result.enforce_ok &&
+              i < policy.enforce_poll_attempts; i++) {
+             result.enforce_ok = read_enforce_enforcing();
+             if (!result.enforce_ok) {
+--- a/src/core/attack/ops.cpp
++++ b/src/core/attack/ops.cpp
+@@ -377,7 +377,7 @@
+             "  fi\n"
+             "  echo \"[*] late-load kmi=$KMI\" >>\"$LOG\"\n"
+             "  chmod 755 \"$KSUD\" 2>/dev/null\n"
+-            "  \"$KSUD\" late-load --kmi \"$KMI\" --allow-shell >>\"$LOG\" 2>&1\n"
++            "  \"$KSUD\" late-load --kmi \"$KMI\" >>\"$LOG\" 2>&1\n"
+             "  echo \"[*] late-load exit=$?\" >>\"$LOG\"\n"
+             "fi\n"
+             "echo \"[*] temp su uid=$(id -u); watching kernelsu.ko\" >>\"$LOG\"\n"
+@@ -397,7 +397,17 @@
+             "fi\n"
+             "else\n"
+             "  echo '[!] fixup failed; SELinux left permissive' >>\"$LOG\"\n"
+-            "fi\n",
++            "  exit 1\n"
++            "fi\n"
++            "for i in $(seq 1 50); do\n"
++            "  [ \"$(cat /sys/fs/selinux/enforce 2>/dev/null)\" = \"1\" ] && break\n"
++            "  sleep 0.1\n"
++            "done\n"
++            "if [ \"$(cat /sys/fs/selinux/enforce 2>/dev/null)\" != \"1\" ]; then\n"
++            "  echo '[!] handoff failed: SELinux is not enforcing' >>\"$LOG\"\n"
++            "  exit 1\n"
++            "fi\n"
++            "echo '[+] handoff confirmed: SELinux enforcing, automatic shell root disabled' >>\"$LOG\"\n",
+             (config::runtime_config_snapshot().home_dir.c_str()),
+             (config::runtime_config_snapshot().ksu_log_path.c_str()),
+             session::g_exploit_session.profile.safe_mode() ? 1 : 0,
+--- a/src/core/tests/handoff_probe_test.cpp
++++ b/src/core/tests/handoff_probe_test.cpp
+@@ -42,6 +42,17 @@
+ } // namespace
+ 
+ int32_t main(void) {
++    /* A loaded module alone is insufficient; failure and missing enforcement
++     * must never produce a ready result. */
++    for (uint32_t bits = 0; bits < 16; ++bits) {
++        session::HandoffProbeResult state;
++        state.module_visible = (bits & 1U) != 0;
++        state.ksu_log_loaded = (bits & 2U) != 0;
++        state.ksu_log_failed = (bits & 4U) != 0;
++        state.enforce_ok = (bits & 8U) != 0;
++        const bool expected = bits == 9U || bits == 10U || bits == 11U;
++        assert(state.ready() == expected);
++    }
+     bool loaded = false;
+     bool failed = false;
+     assert(!ghostlock::session::scan_ksu_log("/nonexistent/.ghostlock_ksu.log",
+@@ -97,10 +108,9 @@
+             handoff_probe_run(policy, loaded_dir.log_path);
+     assert(!probe.module_visible);
+     assert(probe.ksu_log_loaded && !probe.ksu_log_failed);
+-    assert(probe.ready());
++    assert(probe.ready() == probe.enforce_ok);
+     if (access("/sys/fs/selinux/enforce", F_OK) != 0) {
+-        /* Denied read means enforcing. */
+-        assert(probe.enforce_ok);
++        assert(!probe.enforce_ok);
+     }
+ 
+     /* A missing per-run log leaves the log probes false. */
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -10,7 +10,7 @@
+     <application
+         android:name=".GhostlockApplication"
+         android:icon="@mipmap/ic_launcher"
+-        android:label="GhostLock Trial R2"
++        android:label="GhostLock Trial R3"
+         android:roundIcon="@mipmap/ic_launcher"
+         android:supportsRtl="true"
+         android:theme="@style/Theme.GhostLock">
