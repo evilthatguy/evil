@@ -37,6 +37,13 @@ jobs:
 
       - uses: android-actions/setup-android@v4
 
+      - name: Install and inventory the required Android SDK
+        run: |
+          set -euo pipefail
+          sdkmanager --list --channel=3 > "$RUNNER_TEMP/sdk-packages.txt"
+          grep -E 'platforms;|build-tools;|cmake;' "$RUNNER_TEMP/sdk-packages.txt"
+          sdkmanager --channel=3 "platforms;android-37" "build-tools;37.0.0" "cmake;3.22.1"
+
       - uses: gradle/actions/setup-gradle@v6
 
       - uses: dtolnay/rust-toolchain@stable
@@ -172,7 +179,6 @@ jobs:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           set -euo pipefail
-          sdkmanager "platforms;android-37" "build-tools;37.0.0" "cmake;3.22.1"
           cp "$RUNNER_TEMP/trial.jks" manager/trial.jks
           {
             echo "KEYSTORE_FILE=trial.jks"
